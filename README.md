@@ -134,9 +134,22 @@ curl \
 ├── README.md
 ├── build_lambda.sh
 ├── lambda_function.py
-├── main.tf
 ├── variables.tf
+└── apigateway.tf
+└── build_lambda.sh
+└── cognito.tf
+└── dynamodb.tf
+└── iam.tf
+└── lambda_function.py
+└── lambda.tf
+└── main.tf
 └── outputs.tf
+└── providers.tf
+└── secret-manager.tf
+└── terraform.tfvars     
+└── vaulttf
+└── vpc.tf
+
 ```
 
 ## Troubleshooting
