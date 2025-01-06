@@ -1,6 +1,7 @@
-resource "aws_cognito_user_pool" "card_processor_pool" {
-  name = "card-processor-pool-${var.environment}"
-
+resource "aws_cognito_user_pool" "patient_processor_pool" {
+  name = "patient-processor-pool-${var.environment}"
+  deletion_protection = "INACTIVE"
+  
   password_policy {
     minimum_length    = 8
     require_lowercase = true
@@ -22,11 +23,9 @@ resource "aws_cognito_user_pool" "card_processor_pool" {
   }
 }
 
-
-
-resource "aws_cognito_user_pool_client" "card_processor_client" {
-  name         = "card-processor-client-${var.environment}"
-  user_pool_id = aws_cognito_user_pool.card_processor_pool.id
+resource "aws_cognito_user_pool_client" "patient_processor_client" {
+  name         = "patient-processor-client-${var.environment}"
+  user_pool_id = aws_cognito_user_pool.patient_processor_pool.id
 
   explicit_auth_flows = [
     "ALLOW_USER_PASSWORD_AUTH",
@@ -37,7 +36,7 @@ resource "aws_cognito_user_pool_client" "card_processor_client" {
 resource "aws_cognito_user" "pool_users" {
   for_each = var.api_users
 
-  user_pool_id = aws_cognito_user_pool.card_processor_pool.id
+  user_pool_id = aws_cognito_user_pool.patient_processor_pool.id
   username     = each.value.username
 
   attributes = {

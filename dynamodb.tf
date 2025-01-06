@@ -1,12 +1,11 @@
-
-resource "aws_dynamodb_table" "card_tokens" {
-  name           = "card-tokens"
+resource "aws_dynamodb_table" "patient_records" {
+  name           = "patient-records"
   billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "cardToken"
+  hash_key       = "patient_id"
   stream_enabled = false
 
   attribute {
-    name = "cardToken"
+    name = "patient_id"
     type = "S"
   }
 

@@ -35,7 +35,7 @@ variable "hvn_cidr_block" {
 variable "aws_account_id" {
   description = "AWS account ID"
   type        = string
-  default     = "650251728014"
+  default     = "992382806444"
 }
 
 variable "vpc_cidr" {
@@ -72,4 +72,16 @@ variable "vault_namespace" {
   description = "Namespace of Vault"
   type        = string
   default     = "admin"
+}
+
+variable "vault_token" {
+  description = "Vault token"
+  type        = string
+  sensitive   = true
+}
+
+variable "aws_profile" {
+  description = "Profile Of User"
+  type        = string
+  default   = "profile-name"
 }

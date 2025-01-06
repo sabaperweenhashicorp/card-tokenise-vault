@@ -15,7 +15,7 @@ provider "hcp" {
   client_secret = var.hcp_client_secret
 }
 provider "aws" {
-  profile = ""
+  profile = "profile-name"
   region  = "us-east-1"
 }
 

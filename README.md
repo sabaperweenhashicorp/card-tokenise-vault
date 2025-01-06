@@ -1,182 +1,181 @@
-# Card Processing System
+# Patient Processing API
 
-A secure card processing system built with AWS Lambda, API Gateway, Cognito, and HashiCorp Vault for secure token storage.
+This API provides secure endpoints for processing and retrieving patient records with encryption and access control. The infrastructure is deployed using Terraform and integrates with HCP Vault for secure data transformation.
 
-## Overview
+## Quick Start Guide
 
-This system provides a secure way to process and store card information using:
-- AWS Lambda for serverless processing
-- Amazon Cognito for authentication
-- API Gateway for REST endpoints
-- HashiCorp Vault for secure token storage
-- Terraform for infrastructure as code
+### 1. Deploy Infrastructure
 
-## Prerequisites
+Build the Lambda package and deploy the infrastructure:
 
-- AWS CLI installed and configured
-- Terraform >= 1.0.0
-- HashiCorp Vault access
-- Python 3.8 or higher
-- jq (for JSON processing)
-
-## Quick Start
-
-1. Clone the repository:
 ```bash
-git clone [repository-url]
-cd vault-customer-tokenisation
-```
-
-2. Deploy the infrastructure:
-```bash
+# Build Lambda package and deploy infrastructure
 chmod +x build_lambda.sh && ./build_lambda.sh && \
 terraform init && terraform validate && \
 terraform plan && terraform apply -auto-approve
 ```
 
-## Detailed Setup
+### 2. Get Authentication Token
 
-### 1. Package Preparation
-```bash
-# Clean existing packages
-rm -rf lambda_package lambda_function.zip
+Obtain a Cognito authentication token using the AWS CLI:
 
-# Build Lambda package
-chmod +x build_lambda.sh
-./build_lambda.sh
-zip lambda_function.zip lambda_function.py
-```
-
-### 2. Infrastructure Deployment
-```bash
-terraform init
-terraform validate
-terraform plan
-terraform apply -auto-approve
-```
-
-## Usage
-
-### Authentication
-
-1. Get authentication token:
 ```bash
 aws cognito-idp initiate-auth \
   --client-id $(terraform output -raw cognito_client_id) \
   --auth-flow USER_PASSWORD_AUTH \
-  --auth-parameters USERNAME=<username>,PASSWORD=<password> \
-  --profile <aws-profile>
+  --auth-parameters USERNAME=<your-username>,PASSWORD=<your-password> \
+  --profile <your-aws-profile>
 ```
 
-2. Store your credentials:
-```bash
-terraform output user_credentials
-```
+### 3. API Usage Examples
 
-### API Operations
-
-#### Process a New Card
+#### Create/Update Patient Record
 
 ```bash
 curl -X POST \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <jwt-token>" \
-  -H "x-api-key: <api-key>" \
+  'https://<api-gateway-url>/prod/process-patient' \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: <your-api-key>' \
+  -H 'Authorization: Bearer <your-jwt-token>' \
   -d '{
-    "cardNumber": "000011112222",
-    "expMonth": "12",
-    "expYear": "2025",
-    "cvv": "123",
-    "cardholderName": "Example Name"
-  }' \
-  https://<api-gateway-url>/prod/process-card | jq '.'
+    "patient_id": "P1234567811",
+    "name": "Sachin Tendulkar",
+    "email": "sachin.tendulkar@example.com",
+    "mrn": "P1234567811"
+  }' | jq '.'
 ```
 
-#### Retrieve Card Details
+Example Response:
+```json
+{
+  "patient_id": "P1234567811",
+  "encoded_mrn": "DcaCGgUda11",
+  "metadata": {
+    "created_at": "2025-01-06T13:39:23.253271",
+    "created_by": "saba_perween",
+    "email": "saba.perween@abc.com"
+  }
+}
+```
+
+#### Retrieve Patient Record
 
 ```bash
 curl -X GET \
-  -H "x-api-key: <api-key>" \
-  -H "Authorization: Bearer <jwt-token>" \
-  "https://<api-gateway-url>/prod/process-card?token=<card-token>" | jq '.'
+  'https://<api-gateway-url>/prod/process-patient?patient_id=P1234567811' \
+  -H 'x-api-key: <your-api-key>' \
+  -H 'Authorization: Bearer <your-jwt-token>' | jq '.'
 ```
 
-## HashiCorp Vault Integration
-
-### Accessing Vault
-
-#### Web UI Method
-1. Navigate to Vault Dedicated portal
-2. Generate new admin token
-3. Launch web UI
-4. Login to view card tokens
-
-#### API Method
-```bash
-curl \
-    --header "X-Vault-Token: <vault-token>" \
-    --header "X-Vault-Namespace: admin" \
-    "https://<vault-url>/v1/secret/data/card-tokens/<card-token>"
+Example Response:
+```json
+{
+  "created_by": "saba_perween",
+  "timestamp": "2025-01-06T13:39:23.253271",
+  "user_role": "admin",
+  "email": "sachin.tendulkar@example.com",
+  "encoded_mrn": "DcaCGgUda11",
+  "name": "Sachin Tendulkar",
+  "patient_id": "P1234567811"
+}
 ```
 
-## Security Considerations
+## Infrastructure Components
 
-- Never commit sensitive information (tokens, passwords, etc.) to version control
-- Rotate access credentials regularly
-- Monitor AWS CloudWatch logs for suspicious activities
-- Follow the principle of least privilege for IAM roles
-- Regularly audit Vault access logs
+- **API Gateway**: Secure REST API with Cognito authentication and API key validation
+- **Lambda**: Patient processing function in Python 3.9
+- **DynamoDB**: Patient records storage
+- **HCP Vault**: Data encryption and transformation
+- **VPC**: Private networking with NAT gateways
+- **Cognito**: User authentication and authorization
 
-## Project Structure
+## Authentication Details
 
-```
-.
-├── README.md
-├── build_lambda.sh
-├── lambda_function.py
-├── variables.tf
-└── apigateway.tf
-└── build_lambda.sh
-└── cognito.tf
-└── dynamodb.tf
-└── iam.tf
-└── lambda_function.py
-└── lambda.tf
-└── main.tf
-└── outputs.tf
-└── providers.tf
-└── secret-manager.tf
-└── terraform.tfvars     
-└── vaulttf
-└── vpc.tf
+The API requires two forms of authentication:
 
-```
+1. **Cognito JWT Token**: Obtained through the authentication process shown above
+2. **API Key**: Generated during infrastructure deployment and available in Terraform outputs
+
+### Required Headers
+
+| Header          | Description                         | Example                                |
+|-----------------|-------------------------------------|----------------------------------------|
+| Authorization   | Bearer token from Cognito           | Bearer eyJraWQ...                     |
+| x-api-key       | API key for your application        | username-xxxxxxxxxxxxx                 |
+| Content-Type    | Required for POST requests          | application/json                       |
+
+## API Endpoints
+
+### 1. Process Patient Record (POST)
+
+Creates or updates a patient record with encrypted data.
+
+#### Request Body Parameters
+
+| Parameter   | Type   | Description                                |
+|------------|--------|--------------------------------------------|
+| patient_id | string | Unique patient identifier (e.g., P12345678)|
+| name       | string | Patient's full name                        |
+| email      | string | Patient's email address                    |
+| mrn        | string | Medical Record Number (format: P12345678)  |
+
+### 2. Retrieve Patient Record (GET)
+
+Retrieves a patient's record by their ID.
+
+#### Query Parameters
+
+| Parameter  | Type   | Description               |
+|-----------|--------|---------------------------|
+| patient_id | string | Unique patient identifier |
+
+## Data Transformation
+
+The API automatically handles:
+- MRN encryption using HCP Vault's transform engine
+- Metadata addition (timestamp, creator information)
+- Role-based access control
+
+## Security Features
+
+1. **Authentication & Authorization**:
+   - Cognito user pools for identity management
+   - API keys for client application authentication
+   - Role-based access through Cognito user attributes
+
+2. **Data Protection**:
+   - HCP Vault Transform engine for MRN format-preserving encryption
+   - Data encryption at rest in DynamoDB
+   - Secrets management through AWS Secrets Manager
 
 ## Troubleshooting
 
 Common issues and solutions:
 
-1. **Build Script Permission Denied**
-   ```bash
-   chmod +x build_lambda.sh
-   ```
-
-2. **Token Expiration**
-   - JWT tokens expire after 1 hour
-   - Request new token using the authentication process
-
-3. **API Gateway 403 Error**
+1. **Authentication Errors**:
+   - Ensure your JWT token is not expired
    - Verify API key is correct
-   - Check if JWT token is still valid
-   - Ensure proper IAM roles are configured
+   - Check if user exists in Cognito user pool
 
-## Contributing
+2. **Request Errors**:
+   - Validate JSON format in POST requests
+   - Ensure all required fields are present
+   - Check MRN format (should be P followed by 8 digits)
 
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a new Pull Request
+## Monitoring and Logging
 
+- CloudWatch logs enabled for API Gateway and Lambda
+- API Gateway execution logs with INFO level
+- Lambda function logs with DEBUG level
+- Metrics enabled for API Gateway methods
+
+## Support
+
+For issues or questions:
+1. Check CloudWatch logs for detailed error messages
+2. Review API Gateway metrics for performance issues
+3. Contact system administrators for access-related problems
 
 ---
+
+*Note: Replace placeholders (`<api-gateway-url>`, `<your-jwt-token>`, `<your-api-key>`, etc.) with actual values from your deployment.*

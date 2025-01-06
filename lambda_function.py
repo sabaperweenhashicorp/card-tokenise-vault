@@ -4,70 +4,166 @@ import boto3
 import os
 import traceback
 import hvac
+import base64
+import requests
 from datetime import datetime
 from typing import Dict, Any, Tuple
 
+# Configure logging
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)  # Set to DEBUG for maximum verbosity
 
-def get_vault_client() -> hvac.Client:
+def redact_sensitive(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact sensitive information from dictionaries for logging."""
+    sensitive_keys = ['token', 'password', 'secret', 'key', 'Authorization']
+    redacted = data.copy()
+    for k, v in redacted.items():
+        if any(sensitive in k.lower() for sensitive in sensitive_keys):
+            redacted[k] = '[REDACTED]'
+    return redacted
+
+def test_network_connectivity(vault_url: str):
+    """Test network connectivity to Vault server."""
     try:
+        logger.info(f"Testing connection to Vault server: {vault_url}")
+        
+        # Parse the vault URL
+        from urllib.parse import urlparse
+        parsed_url = urlparse(vault_url)
+        host = parsed_url.netloc.split(':')[0]
+        
+        # Test DNS resolution
+        logger.info(f"Testing DNS resolution for {host}")
+        import socket
+        ip_address = socket.gethostbyname(host)
+        logger.info(f"DNS resolution successful. IP: {ip_address}")
+        
+        # Test TCP connection
+        logger.info(f"Testing TCP connection to {host}:8200")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        result = sock.connect_ex((ip_address, 8200))
+        sock.close()
+        
+        if result == 0:
+            logger.info("TCP connection successful")
+        else:
+            logger.error(f"TCP connection failed with error code: {result}")
+            
+        # Test HTTPS connection
+        logger.info("Testing HTTPS connection")
+        import requests
+        response = requests.get(
+            f"{vault_url}/v1/sys/health",
+            timeout=5,
+            verify=True
+        )
+        logger.info(f"HTTPS connection successful. Status code: {response.status_code}")
+        
+    except Exception as e:
+        logger.error(f"Network test failed: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise
+
+def get_vault_client() -> Tuple[hvac.Client, Dict[str, str]]:
+    try:
+        logger.info("Starting Vault client initialization")
+        
         secrets_client = boto3.client('secretsmanager')
         vault_creds = secrets_client.get_secret_value(
             SecretId=os.environ['VAULT_CREDENTIALS_SECRET']
         )
         vault_config = json.loads(vault_creds['SecretString'])
         
+        # Test network connectivity before creating client
+        test_network_connectivity(vault_config['VAULT_ADDR'])
+        
         client = hvac.Client(
-            url=vault_config['VAULT_ADDR'],
+            url=vault_config['VAULT_ADDR'].rstrip('/'),
             token=vault_config['VAULT_TOKEN'],
-            namespace=vault_config['VAULT_NAMESPACE']
+            namespace=vault_config.get('VAULT_NAMESPACE', 'admin'),
+            timeout=10
         )
         
-        return client
+        return client, vault_config
+        
     except Exception as e:
         logger.error(f"Failed to initialize Vault client: {str(e)}")
+        logger.error(traceback.format_exc())
         raise
-
-def store_card_in_vault(vault_client: hvac.Client, card_data: Dict[str, str]) -> str:
+    
+def encode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], mrn: str) -> str:
+    """Encode patient MRN with detailed logging."""
     try:
-        timestamp = datetime.now().isoformat()
-        token = f"card-{card_data['cardNumber'][-4:]}-{timestamp}"
+        logger.info(f"Starting MRN encoding process for MRN pattern: {mrn[:2]}****")
         
-        vault_client.secrets.kv.v2.create_or_update_secret(
-            path=f'card-tokens/{token}',
-            secret=dict(
-                card_number=card_data['cardNumber'],
-                cvv=card_data['cvv'],
-                exp_month=card_data['expMonth'],
-                exp_year=card_data['expYear'],
-                cardholder_name=card_data['cardholderName']
-            )
-        )
+        # Construct URL
+        base_url = vault_client.url.rstrip('/')
+        url = f"{base_url}/v1/transform/encode/{config['VAULT_PATIENT_ROLE']}"
+        logger.info(f"Using Vault endpoint: {url}")
         
-        return token
-    except Exception as e:
-        logger.error(f"Failed to store card in Vault: {str(e)}")
-        raise
-
-def get_card_from_vault(vault_client: hvac.Client, token: str) -> Dict[str, Any]:
-    try:
-        secret = vault_client.secrets.kv.v2.read_secret_version(
-            path=f'card-tokens/{token}'
+        # Prepare request
+        headers = {
+            'X-Vault-Token': config['VAULT_TOKEN'],
+            'X-Vault-Namespace': config['VAULT_NAMESPACE'],
+            'Content-Type': 'application/json'
+        }
+        logger.info("Request headers (redacted): %s", redact_sensitive(headers))
+        
+        payload = {
+            'value': mrn,
+            'transformation': 'patient-mrn'
+        }
+        logger.info("Request payload: %s", json.dumps(payload))
+        
+        # Make request
+        logger.info("Sending request to Vault...")
+        response = requests.post(
+            url=url,
+            json=payload,
+            headers=headers,
+            verify=True,
+            timeout=10
         )
-        return secret['data']['data']
+        logger.info(f"Vault response status code: {response.status_code}")
+        
+        # Handle response
+        if response.status_code == 200:
+            result = response.json()
+            logger.info("Successfully encoded MRN")
+            return result['data']['encoded_value']
+        
+        logger.error(f"Failed to encode MRN. Status: {response.status_code}")
+        logger.error(f"Response body: {response.text}")
+        raise Exception(f"Failed to encode patient MRN: {response.text}")
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"HTTP Request failed: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
+        raise
     except Exception as e:
-        logger.error(f"Failed to retrieve card from Vault: {str(e)}")
+        logger.error(f"Unexpected error in encode_patient_mrn: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
         raise
 
-def handle_post_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dict[str, Any]:
+def handle_patient_post_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle patient record creation with detailed logging."""
     try:
+        logger.info("Starting patient record creation")
+        logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
+        logger.info(f"User info: {json.dumps(redact_sensitive(user_info))}")
+        
+        # Parse request body
         request_data = json.loads(event.get('body', '{}'))
-        logger.info("Parsing request body")
+        logger.info(f"Request data: {json.dumps(redact_sensitive(request_data))}")
         
-        required_fields = ['cardNumber', 'expMonth', 'expYear', 'cvv', 'cardholderName']
+        # Validate required fields
+        required_fields = ['patient_id', 'name', 'email', 'mrn']
         missing_fields = [field for field in required_fields if field not in request_data]
         if missing_fields:
+            logger.warning(f"Missing required fields: {missing_fields}")
             return {
                 'statusCode': 400,
                 'headers': {'Content-Type': 'application/json'},
@@ -77,74 +173,54 @@ def handle_post_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dic
                 })
             }
         
-        vault_client = get_vault_client()
+        # Initialize Vault client
+        logger.info("Initializing Vault client...")
+        vault_client, vault_config = get_vault_client()
         
-        card_data = {
-            'cardNumber': request_data['cardNumber'].replace(' ', ''),
-            'expMonth': request_data['expMonth'],
-            'expYear': request_data['expYear'],
-            'cvv': request_data['cvv'],
-            'cardholderName': request_data['cardholderName']
+        # Encode MRN
+        logger.info("Encoding patient MRN...")
+        encoded_mrn = encode_patient_mrn(vault_client, vault_config, request_data['mrn'])
+        logger.info("Successfully encoded MRN")
+        
+        # Process patient data
+        patient_data = {
+            'patient_id': request_data['patient_id'],
+            'name': request_data['name'],
+            'email': request_data['email'],
+            'mrn': encoded_mrn
         }
         
-        token = store_card_in_vault(vault_client, card_data)
-        
+        logger.info("Storing patient record in DynamoDB...")
         dynamodb = boto3.resource('dynamodb')
-        table_name = os.environ.get('DYNAMODB_TABLE')
-        if not table_name:
-            return {
-                'statusCode': 500,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': 'Server configuration error',
-                    'error_details': {
-                        'error': 'DYNAMODB_TABLE environment variable is not set'
-                    }
-                })
-            }
+        table = dynamodb.Table(os.environ['PATIENT_DYNAMODB_TABLE'])
         
-        table = dynamodb.Table(table_name)
-        
-        timestamp = datetime.now().isoformat()
         item = {
-            'cardToken': token,
-            'lastFour': card_data['cardNumber'][-4:],
-            'cardholderName': card_data['cardholderName'],
-            'expiryMonth': card_data['expMonth'],
-            'expiryYear': card_data['expYear'],
-            'timestamp': timestamp,
-            'createdBy': user_info['username'],
-            'userRole': user_info['role']
+            'patient_id': patient_data['patient_id'],
+            'name': patient_data['name'],
+            'email': patient_data['email'],
+            'encoded_mrn': patient_data['mrn'],
+            'timestamp': datetime.now().isoformat(),
+            'created_by': user_info['username'],
+            'user_role': user_info.get('role', 'user')
         }
         
-        try:
-            table.put_item(Item=item)
-        except Exception as e:
-            logger.error(f"Failed to store in DynamoDB: {str(e)}")
-            return {
-                'statusCode': 500,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': 'Failed to store data',
-                    'error_details': {'error': str(e)}
-                })
-            }
+        table.put_item(Item=item)
+        logger.info("Successfully stored patient record")
         
+        # Prepare response
         response_data = {
-            'token': token,
-            'lastFour': card_data['cardNumber'][-4:],
-            'cardholderName': card_data['cardholderName'],
-            'expiryMonth': card_data['expMonth'],
-            'expiryYear': card_data['expYear']
+            'patient_id': patient_data['patient_id'],
+            'encoded_mrn': encoded_mrn
         }
         
         if user_info.get('role') == 'admin':
             response_data['metadata'] = {
-                'createdAt': timestamp,
-                'createdBy': user_info['username'],
-                'email': user_info['email']
+                'created_at': item['timestamp'],
+                'created_by': user_info['username'],
+                'email': user_info.get('email')
             }
         
+        logger.info("Returning successful response")
         return {
             'statusCode': 200,
             'headers': {
@@ -155,140 +231,10 @@ def handle_post_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dic
         }
         
     except Exception as e:
-        logger.error(f"Error in handle_post_request: {str(e)}")
+        logger.error(f"Error in handle_patient_post_request: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
         return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': 'Internal server error',
-                'error_details': {'error': str(e)}
-            })
-        }
-
-def handle_get_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        token = event.get('queryStringParameters', {}).get('token')
-        if not token:
-            return {
-                'statusCode': 400,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': 'Token is required',
-                    'error_details': {'missing_parameter': 'token'}
-                })
-            }
-
-        vault_client = get_vault_client()
-        
-        try:
-            card_data = get_card_from_vault(vault_client, token)
-            
-            dynamodb = boto3.resource('dynamodb')
-            table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
-            response = table.get_item(Key={'cardToken': token})
-            
-            if 'Item' not in response:
-                return {
-                    'statusCode': 404,
-                    'headers': {'Content-Type': 'application/json'},
-                    'body': json.dumps({
-                        'message': 'Token not found',
-                        'error_details': {'token': token}
-                    })
-                }
-            
-            item = response['Item']
-            
-            result = {
-                'lastFour': card_data['card_number'][-4:],
-                'cardholderName': card_data['cardholder_name'],
-                'expiryMonth': card_data['exp_month'],
-                'expiryYear': card_data['exp_year']
-            }
-            
-            if user_info.get('role') == 'admin':
-                result['metadata'] = {
-                    'createdAt': item['timestamp'],
-                    'createdBy': item.get('createdBy'),
-                    'userRole': item.get('userRole')
-                }
-                result['cardDetails'] = {
-                    'cardNumber': f"****-****-****-{card_data['card_number'][-4:]}",
-                    'cvv': '***' 
-                }
-            
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps(result)
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to retrieve card data: {str(e)}")
-            return {
-                'statusCode': 500,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': 'Failed to retrieve card data',
-                    'error_details': {'error': str(e)}
-                })
-            }
-            
-    except Exception as e:
-        logger.error(f"Error in handle_get_request: {str(e)}")
-        return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': 'Internal server error',
-                'error_details': {'error': str(e)}
-            })
-        }
-
-
-def lambda_handler(event, context):
-    try:
-        logger.info(f"Received event: {json.dumps(event, default=str)}")
-        logger.info("=== Running Lambda Version 1.0 ===")
-        logger.info(f"DYNAMODB_TABLE env var: {os.environ.get('DYNAMODB_TABLE')}")
-        
-        http_method = event.get('httpMethod')
-        logger.info(f"HTTP Method: {http_method}")
-        
-        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
-        logger.info(f"Auth Claims: {json.dumps(claims)}")
-        
-        user_info = {
-            'username': claims.get('cognito:username'),
-            'email': claims.get('email'),
-            'role': claims.get('custom:role', 'user')
-        }
-        logger.info(f"User Info: {json.dumps(user_info)}")
-        
-        if http_method == 'GET':
-            return handle_get_request(event, user_info)
-        elif http_method == 'POST':
-            return handle_post_request(event, user_info)
-        else:
-            error_response = {
-                'statusCode': 405,
-                'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': f'Method not allowed: {http_method}',
-                    'error_details': {
-                        'method': http_method,
-                        'allowed_methods': ['GET', 'POST']
-                    }
-                })
-            }
-            return error_response
-            
-    except Exception as e:
-        logger.error(f"Unexpected error in lambda_handler: {str(e)}")
-        error_response = {
             'statusCode': 500,
             'headers': {'Content-Type': 'application/json'},
             'body': json.dumps({
@@ -299,4 +245,282 @@ def lambda_handler(event, context):
                 }
             })
         }
-        return error_response
+
+def handle_patient_get_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Starting GET request handler")
+        logger.info(f"Event: {json.dumps(event)}")
+        logger.info(f"User info: {json.dumps(user_info)}")
+
+        # Get patient_id from query parameters
+        query_params = event.get('queryStringParameters', {})
+        logger.info(f"Query parameters: {query_params}")
+        
+        if not query_params or 'patient_id' not in query_params:
+            logger.error("Missing patient_id in query parameters")
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    'message': 'patient_id is required'
+                })
+            }
+
+        patient_id = query_params['patient_id']
+        logger.info(f"Retrieving patient with ID: {patient_id}")
+
+        # Get the DynamoDB table
+        try:
+            dynamodb = boto3.resource('dynamodb')
+            table = dynamodb.Table(os.environ['PATIENT_DYNAMODB_TABLE'])
+            logger.info(f"Successfully connected to DynamoDB table: {os.environ['PATIENT_DYNAMODB_TABLE']}")
+        except Exception as e:
+            logger.error(f"Failed to connect to DynamoDB: {str(e)}")
+            raise
+
+        # Get the item from DynamoDB
+        try:
+            response = table.get_item(Key={'patient_id': patient_id})
+            logger.info(f"DynamoDB response: {json.dumps(response)}")
+        except Exception as e:
+            logger.error(f"Failed to get item from DynamoDB: {str(e)}")
+            raise
+
+        if 'Item' not in response:
+            logger.info(f"No patient found with ID: {patient_id}")
+            return {
+                'statusCode': 404,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    'message': 'Patient not found'
+                })
+            }
+
+        item = response['Item']
+        logger.info("Successfully retrieved patient record")
+
+        # If admin user and encoded_mrn exists, decode it
+        if user_info.get('role') == 'admin' and 'encoded_mrn' in item:
+            try:
+                logger.info("Attempting to decode MRN for admin user")
+                vault_client, vault_config = get_vault_client()
+                decoded_mrn = decode_patient_mrn(vault_client, vault_config, item['encoded_mrn'])
+                item['mrn'] = decoded_mrn
+                logger.info("Successfully decoded MRN")
+            except Exception as e:
+                logger.error(f"Failed to decode MRN: {str(e)}")
+                # Continue without decoded MRN
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps(item)
+        }
+
+    except Exception as e:
+        logger.error(f"Error in handle_patient_get_request: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'Internal server error',
+                'error_details': {
+                    'error': str(e),
+                    'trace': traceback.format_exc()
+                }
+            })
+        }
+
+# Update lambda_handler to include GET method
+def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+    """Main Lambda handler with detailed logging."""
+    try:
+        logger.info("Lambda handler started")
+        logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
+        logger.info(f"Lambda context: {context}")
+        
+        http_method = event.get('httpMethod')
+        resource_path = event.get('resource', '')
+        logger.info(f"HTTP Method: {http_method}, Resource: {resource_path}")
+        
+        # Extract user info from claims
+        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
+        user_info = {
+            'username': claims.get('cognito:username'),
+            'email': claims.get('email'),
+            'role': claims.get('custom:role', 'user')
+        }
+        logger.info(f"User info from claims: {json.dumps(redact_sensitive(user_info))}")
+        
+        # Handle request based on path and method
+        if resource_path == '/process-patient':
+            if http_method == 'POST':
+                logger.info("Processing POST request for patient")
+                return handle_patient_post_request(event, user_info)
+            elif http_method == 'GET':
+                logger.info("Processing GET request for patient")
+                return handle_patient_get_request(event, user_info)
+            else:
+                logger.warning(f"Method not allowed: {http_method}")
+                return {
+                    'statusCode': 405,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({
+                        'message': f'Method not allowed: {http_method}',
+                        'error_details': {
+                            'method': http_method,
+                            'allowed_methods': ['GET', 'POST']
+                        }
+                    })
+                }
+        
+        logger.warning(f"Resource not found: {resource_path}")
+        return {
+            'statusCode': 404,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': f'Resource not found: {resource_path}',
+                'error_details': {
+                    'resource': resource_path,
+                    'method': http_method
+                }
+            })
+        }
+            
+    except Exception as e:
+        logger.error(f"Unexpected error in lambda_handler: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'Internal server error',
+                'error_details': {
+                    'error': str(e),
+                    'trace': traceback.format_exc()
+                }
+            })
+        }
+    try:
+        logger.info(f"Received event: {json.dumps(event)}")
+        
+        http_method = event.get('httpMethod')
+        resource_path = event.get('resource', '')
+        
+        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
+        user_info = {
+            'username': claims.get('cognito:username'),
+            'email': claims.get('email'),
+            'role': claims.get('custom:role', 'user')
+        }
+        
+        if resource_path == '/process-patient':
+            if http_method == 'POST':
+                return handle_patient_post_request(event, user_info)
+            elif http_method == 'GET':
+                return handle_patient_get_request(event, user_info)
+            else:
+                return {
+                    'statusCode': 405,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({
+                        'message': f'Method not allowed: {http_method}',
+                        'error_details': {
+                            'method': http_method,
+                            'allowed_methods': ['GET', 'POST']
+                        }
+                    })
+                }
+        
+        return {
+            'statusCode': 404,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': f'Resource not found: {resource_path}',
+                'error_details': {'resource': resource_path}
+            })
+        }
+            
+    except Exception as e:
+        logger.error(f"Error in lambda_handler: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'Internal server error',
+                'error_details': {'error': str(e)}
+            })
+        }
+
+    """Main Lambda handler with detailed logging."""
+    try:
+        logger.info("Lambda handler started")
+        logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
+        logger.info(f"Lambda context: {context}")
+        
+        http_method = event.get('httpMethod')
+        resource_path = event.get('resource', '')
+        logger.info(f"HTTP Method: {http_method}, Resource: {resource_path}")
+        
+        # Extract user info from claims
+        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
+        user_info = {
+            'username': claims.get('cognito:username'),
+            'email': claims.get('email'),
+            'role': claims.get('custom:role', 'user')
+        }
+        logger.info(f"User info from claims: {json.dumps(redact_sensitive(user_info))}")
+        
+        # Handle request based on path and method
+        if resource_path == '/process-patient':
+            if http_method == 'POST':
+                logger.info("Processing POST request for patient")
+                return handle_patient_post_request(event, user_info)
+            else:
+                logger.warning(f"Method not allowed: {http_method}")
+                return {
+                    'statusCode': 405,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({
+                        'message': f'Method not allowed: {http_method}',
+                        'error_details': {
+                            'method': http_method,
+                            'allowed_methods': ['POST']
+                        }
+                    })
+                }
+        
+        logger.warning(f"Resource not found: {resource_path}")
+        return {
+            'statusCode': 404,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': f'Resource not found: {resource_path}',
+                'error_details': {
+                    'resource': resource_path,
+                    'method': http_method
+                }
+            })
+        }
+            
+    except Exception as e:
+        logger.error(f"Unexpected error in lambda_handler: {str(e)}")
+        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'Internal server error',
+                'error_details': {
+                    'error': str(e),
+                    'trace': traceback.format_exc()
+                }
+            })
+        }

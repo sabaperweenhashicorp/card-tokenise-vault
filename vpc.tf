@@ -103,21 +103,3 @@ resource "aws_route_table_association" "private" {
   subnet_id      = aws_subnet.private[count.index].id
   route_table_id = aws_route_table.private[count.index].id
 }
-
-resource "aws_security_group" "lambda" {
-  name        = "lambda-sg-${var.environment}"
-  description = "Security group for Lambda function"
-  vpc_id      = aws_vpc.main.id
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name        = "lambda-sg-${var.environment}"
-    Environment = var.environment
-  }
-}

@@ -20,3 +20,6 @@ api_users = {
     role     = "user"
   }
 }
+
+vault_token     = "token"
+vault_namespace = "admin"
