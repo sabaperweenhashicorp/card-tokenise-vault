@@ -83,5 +83,5 @@ variable "vault_token" {
 variable "aws_profile" {
   description = "Profile Of User"
   type        = string
-  default   = "profile-name"
+  default   = ""
 }

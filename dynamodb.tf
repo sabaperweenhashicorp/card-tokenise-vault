@@ -9,6 +9,17 @@ resource "aws_dynamodb_table" "patient_records" {
     type = "S"
   }
 
+  attribute {
+    name = "encoded_mrn"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name               = "encoded_mrn-index"
+    hash_key           = "encoded_mrn"
+    projection_type    = "ALL"
+  }
+
   tags = {
     Environment = "production"
   }

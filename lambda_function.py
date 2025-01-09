@@ -8,13 +8,14 @@ import base64
 import requests
 from datetime import datetime
 from typing import Dict, Any, Tuple
+from urllib.parse import urlparse
+import socket
+import re
 
-# Configure logging
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)  # Set to DEBUG for maximum verbosity
+logger.setLevel(logging.DEBUG)
 
 def redact_sensitive(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Redact sensitive information from dictionaries for logging."""
     sensitive_keys = ['token', 'password', 'secret', 'key', 'Authorization']
     redacted = data.copy()
     for k, v in redacted.items():
@@ -23,26 +24,20 @@ def redact_sensitive(data: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 def test_network_connectivity(vault_url: str):
-    """Test network connectivity to Vault server."""
     try:
         logger.info(f"Testing connection to Vault server: {vault_url}")
-        
-        # Parse the vault URL
-        from urllib.parse import urlparse
         parsed_url = urlparse(vault_url)
         host = parsed_url.netloc.split(':')[0]
+        port = int(parsed_url.port or 8200)
         
-        # Test DNS resolution
         logger.info(f"Testing DNS resolution for {host}")
-        import socket
         ip_address = socket.gethostbyname(host)
         logger.info(f"DNS resolution successful. IP: {ip_address}")
         
-        # Test TCP connection
-        logger.info(f"Testing TCP connection to {host}:8200")
+        logger.info(f"Testing TCP connection to {host}:{port}")
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
-        result = sock.connect_ex((ip_address, 8200))
+        result = sock.connect_ex((ip_address, port))
         sock.close()
         
         if result == 0:
@@ -50,9 +45,7 @@ def test_network_connectivity(vault_url: str):
         else:
             logger.error(f"TCP connection failed with error code: {result}")
             
-        # Test HTTPS connection
         logger.info("Testing HTTPS connection")
-        import requests
         response = requests.get(
             f"{vault_url}/v1/sys/health",
             timeout=5,
@@ -75,7 +68,11 @@ def get_vault_client() -> Tuple[hvac.Client, Dict[str, str]]:
         )
         vault_config = json.loads(vault_creds['SecretString'])
         
-        # Test network connectivity before creating client
+        required_config = ['VAULT_ADDR', 'VAULT_TOKEN', 'VAULT_NAMESPACE', 'VAULT_PATIENT_ROLE']
+        missing = [k for k in required_config if k not in vault_config]
+        if missing:
+            raise ValueError(f"Missing required vault config: {missing}")
+        
         test_network_connectivity(vault_config['VAULT_ADDR'])
         
         client = hvac.Client(
@@ -91,18 +88,31 @@ def get_vault_client() -> Tuple[hvac.Client, Dict[str, str]]:
         logger.error(f"Failed to initialize Vault client: {str(e)}")
         logger.error(traceback.format_exc())
         raise
+
+def validate_mrn_format(mrn: str) -> str:
+    """
+    Validates and formats an MRN to match the Vault template pattern (####-####-####).
+    Returns the formatted MRN if valid, raises ValueError if invalid.
+    """
+    clean_mrn = ''.join(c for c in mrn if c.isdigit())
+    if len(clean_mrn) != 12:
+        raise ValueError(f"MRN must contain exactly 12 digits. Got {len(clean_mrn)} digits.")
     
+    if not clean_mrn.isdigit():
+        raise ValueError("MRN must contain only numeric characters (0-9)")
+    
+    formatted_mrn = f"{clean_mrn[0:4]}-{clean_mrn[4:8]}-{clean_mrn[8:12]}"
+    return formatted_mrn
+
 def encode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], mrn: str) -> str:
-    """Encode patient MRN with detailed logging."""
     try:
-        logger.info(f"Starting MRN encoding process for MRN pattern: {mrn[:2]}****")
+        formatted_mrn = validate_mrn_format(mrn)
+        logger.info(f"Starting MRN encoding process for MRN pattern: XXXX-****-****")
         
-        # Construct URL
         base_url = vault_client.url.rstrip('/')
         url = f"{base_url}/v1/transform/encode/{config['VAULT_PATIENT_ROLE']}"
         logger.info(f"Using Vault endpoint: {url}")
         
-        # Prepare request
         headers = {
             'X-Vault-Token': config['VAULT_TOKEN'],
             'X-Vault-Namespace': config['VAULT_NAMESPACE'],
@@ -111,12 +121,11 @@ def encode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], mrn: s
         logger.info("Request headers (redacted): %s", redact_sensitive(headers))
         
         payload = {
-            'value': mrn,
+            'value': formatted_mrn,
             'transformation': 'patient-mrn'
         }
         logger.info("Request payload: %s", json.dumps(payload))
         
-        # Make request
         logger.info("Sending request to Vault...")
         response = requests.post(
             url=url,
@@ -127,7 +136,6 @@ def encode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], mrn: s
         )
         logger.info(f"Vault response status code: {response.status_code}")
         
-        # Handle response
         if response.status_code == 200:
             result = response.json()
             logger.info("Successfully encoded MRN")
@@ -137,29 +145,83 @@ def encode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], mrn: s
         logger.error(f"Response body: {response.text}")
         raise Exception(f"Failed to encode patient MRN: {response.text}")
         
+    except ValueError as e:
+        raise
     except requests.exceptions.RequestException as e:
         logger.error(f"HTTP Request failed: {str(e)}")
-        logger.error("Full traceback:")
         logger.error(traceback.format_exc())
         raise
     except Exception as e:
         logger.error(f"Unexpected error in encode_patient_mrn: {str(e)}")
-        logger.error("Full traceback:")
+        logger.error(traceback.format_exc())
+        raise
+
+def decode_patient_mrn(vault_client: hvac.Client, config: Dict[str, str], encoded_mrn: str, format: str = 'default') -> str:
+    try:
+        logger.info(f"Starting MRN decoding process with format: {format}")
+        
+        transform_mount_point = 'transform'
+        role_name = config['VAULT_PATIENT_ROLE']
+        
+        try:
+            response = vault_client.secrets.transform.decode(
+                role_name=role_name,
+                value=encoded_mrn,
+                transformation='patient-mrn',
+                mount_point=transform_mount_point,
+                decode_format=format
+            )
+            
+            logger.info(f"Direct hvac response: {json.dumps(response)}")
+            return response['data']['decoded_value']
+            
+        except Exception as e:
+            logger.error(f"Direct hvac decode failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            
+            base_url = vault_client.url.rstrip('/')
+            url = f"{base_url}/v1/transform/decode/{config['VAULT_PATIENT_ROLE']}"
+            
+            headers = {
+                'X-Vault-Token': config['VAULT_TOKEN'],
+                'X-Vault-Namespace': config['VAULT_NAMESPACE'],
+                'Content-Type': 'application/json'
+            }
+            payload = {
+                'value': encoded_mrn,
+                'transformation': 'patient-mrn',
+                'decode_format': format
+            }
+
+            logger.info("Request details:")
+            logger.info(f"URL: {url}")
+            logger.info(f"Headers (redacted): {redact_sensitive(headers)}")
+            logger.info(f"Payload: {json.dumps(payload, indent=2)}")
+            
+            response = requests.post(url=url, json=payload, headers=headers, verify=True)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['data']['decoded_value']
+                
+            logger.error(f"Failed to decode MRN. Status: {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            raise Exception(f"Failed to decode MRN: {response.text}")
+            
+    except Exception as e:
+        logger.error(f"Error in decode_patient_mrn: {str(e)}")
         logger.error(traceback.format_exc())
         raise
 
 def handle_patient_post_request(event: Dict[str, Any], user_info: Dict[str, Any]) -> Dict[str, Any]:
-    """Handle patient record creation with detailed logging."""
     try:
         logger.info("Starting patient record creation")
         logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
         logger.info(f"User info: {json.dumps(redact_sensitive(user_info))}")
         
-        # Parse request body
         request_data = json.loads(event.get('body', '{}'))
         logger.info(f"Request data: {json.dumps(redact_sensitive(request_data))}")
         
-        # Validate required fields
         required_fields = ['patient_id', 'name', 'email', 'mrn']
         missing_fields = [field for field in required_fields if field not in request_data]
         if missing_fields:
@@ -172,33 +234,39 @@ def handle_patient_post_request(event: Dict[str, Any], user_info: Dict[str, Any]
                     'error_details': {'missing_fields': missing_fields}
                 })
             }
+            
+        try:
+            _ = validate_mrn_format(request_data['mrn'])
+        except ValueError as e:
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({
+                    'message': 'Invalid MRN format',
+                    'error_details': {
+                        'expected': 'XXXX-XXXX-XXXX (12 digits)',
+                        'received': request_data['mrn'],
+                        'error': str(e)
+                    }
+                })
+            }
         
-        # Initialize Vault client
         logger.info("Initializing Vault client...")
         vault_client, vault_config = get_vault_client()
         
-        # Encode MRN
         logger.info("Encoding patient MRN...")
         encoded_mrn = encode_patient_mrn(vault_client, vault_config, request_data['mrn'])
         logger.info("Successfully encoded MRN")
-        
-        # Process patient data
-        patient_data = {
-            'patient_id': request_data['patient_id'],
-            'name': request_data['name'],
-            'email': request_data['email'],
-            'mrn': encoded_mrn
-        }
         
         logger.info("Storing patient record in DynamoDB...")
         dynamodb = boto3.resource('dynamodb')
         table = dynamodb.Table(os.environ['PATIENT_DYNAMODB_TABLE'])
         
         item = {
-            'patient_id': patient_data['patient_id'],
-            'name': patient_data['name'],
-            'email': patient_data['email'],
-            'encoded_mrn': patient_data['mrn'],
+            'patient_id': request_data['patient_id'],
+            'name': request_data['name'],
+            'email': request_data['email'],
+            'encoded_mrn': encoded_mrn,
             'timestamp': datetime.now().isoformat(),
             'created_by': user_info['username'],
             'user_role': user_info.get('role', 'user')
@@ -207,9 +275,8 @@ def handle_patient_post_request(event: Dict[str, Any], user_info: Dict[str, Any]
         table.put_item(Item=item)
         logger.info("Successfully stored patient record")
         
-        # Prepare response
         response_data = {
-            'patient_id': patient_data['patient_id'],
+            'patient_id': request_data['patient_id'],
             'encoded_mrn': encoded_mrn
         }
         
@@ -232,7 +299,6 @@ def handle_patient_post_request(event: Dict[str, Any], user_info: Dict[str, Any]
         
     except Exception as e:
         logger.error(f"Error in handle_patient_post_request: {str(e)}")
-        logger.error("Full traceback:")
         logger.error(traceback.format_exc())
         return {
             'statusCode': 500,
@@ -252,64 +318,56 @@ def handle_patient_get_request(event: Dict[str, Any], user_info: Dict[str, Any])
         logger.info(f"Event: {json.dumps(event)}")
         logger.info(f"User info: {json.dumps(user_info)}")
 
-        # Get patient_id from query parameters
         query_params = event.get('queryStringParameters', {})
         logger.info(f"Query parameters: {query_params}")
         
-        if not query_params or 'patient_id' not in query_params:
-            logger.error("Missing patient_id in query parameters")
+        if not query_params or ('patient_id' not in query_params and 'encoded_mrn' not in query_params):
+            logger.error("Missing required query parameters")
             return {
                 'statusCode': 400,
                 'headers': {'Content-Type': 'application/json'},
                 'body': json.dumps({
-                    'message': 'patient_id is required'
+                    'message': 'Either patient_id or encoded_mrn is required'
                 })
             }
 
-        patient_id = query_params['patient_id']
-        logger.info(f"Retrieving patient with ID: {patient_id}")
+        dynamodb = boto3.resource('dynamodb')
+        table = dynamodb.Table(os.environ['PATIENT_DYNAMODB_TABLE'])
 
-        # Get the DynamoDB table
-        try:
-            dynamodb = boto3.resource('dynamodb')
-            table = dynamodb.Table(os.environ['PATIENT_DYNAMODB_TABLE'])
-            logger.info(f"Successfully connected to DynamoDB table: {os.environ['PATIENT_DYNAMODB_TABLE']}")
-        except Exception as e:
-            logger.error(f"Failed to connect to DynamoDB: {str(e)}")
-            raise
-
-        # Get the item from DynamoDB
-        try:
-            response = table.get_item(Key={'patient_id': patient_id})
-            logger.info(f"DynamoDB response: {json.dumps(response)}")
-        except Exception as e:
-            logger.error(f"Failed to get item from DynamoDB: {str(e)}")
-            raise
+        if 'patient_id' in query_params:
+            response = table.get_item(Key={'patient_id': query_params['patient_id']})
+        else:
+            response = table.query(
+                IndexName='encoded_mrn-index',
+                KeyConditionExpression='encoded_mrn = :mrn',
+                ExpressionAttributeValues={':mrn': query_params['encoded_mrn']}
+            )
+            if response.get('Items'):
+                response = {'Item': response['Items'][0]}
+            else:
+                response = {}
 
         if 'Item' not in response:
-            logger.info(f"No patient found with ID: {patient_id}")
             return {
                 'statusCode': 404,
                 'headers': {'Content-Type': 'application/json'},
-                'body': json.dumps({
-                    'message': 'Patient not found'
-                })
+                'body': json.dumps({'message': 'Patient not found'})
             }
 
         item = response['Item']
-        logger.info("Successfully retrieved patient record")
-
-        # If admin user and encoded_mrn exists, decode it
+        
         if user_info.get('role') == 'admin' and 'encoded_mrn' in item:
             try:
                 logger.info("Attempting to decode MRN for admin user")
                 vault_client, vault_config = get_vault_client()
+                
+                # Get both full MRN and last four digits for admin users
                 decoded_mrn = decode_patient_mrn(vault_client, vault_config, item['encoded_mrn'])
+                
                 item['mrn'] = decoded_mrn
                 logger.info("Successfully decoded MRN")
             except Exception as e:
                 logger.error(f"Failed to decode MRN: {str(e)}")
-                # Continue without decoded MRN
 
         return {
             'statusCode': 200,
@@ -335,9 +393,7 @@ def handle_patient_get_request(event: Dict[str, Any], user_info: Dict[str, Any])
             })
         }
 
-# Update lambda_handler to include GET method
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """Main Lambda handler with detailed logging."""
     try:
         logger.info("Lambda handler started")
         logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
@@ -347,7 +403,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         resource_path = event.get('resource', '')
         logger.info(f"HTTP Method: {http_method}, Resource: {resource_path}")
         
-        # Extract user info from claims
         claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
         user_info = {
             'username': claims.get('cognito:username'),
@@ -356,7 +411,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
         logger.info(f"User info from claims: {json.dumps(redact_sensitive(user_info))}")
         
-        # Handle request based on path and method
         if resource_path == '/process-patient':
             if http_method == 'POST':
                 logger.info("Processing POST request for patient")
@@ -393,125 +447,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             
     except Exception as e:
         logger.error(f"Unexpected error in lambda_handler: {str(e)}")
-        logger.error("Full traceback:")
-        logger.error(traceback.format_exc())
-        return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': 'Internal server error',
-                'error_details': {
-                    'error': str(e),
-                    'trace': traceback.format_exc()
-                }
-            })
-        }
-    try:
-        logger.info(f"Received event: {json.dumps(event)}")
-        
-        http_method = event.get('httpMethod')
-        resource_path = event.get('resource', '')
-        
-        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
-        user_info = {
-            'username': claims.get('cognito:username'),
-            'email': claims.get('email'),
-            'role': claims.get('custom:role', 'user')
-        }
-        
-        if resource_path == '/process-patient':
-            if http_method == 'POST':
-                return handle_patient_post_request(event, user_info)
-            elif http_method == 'GET':
-                return handle_patient_get_request(event, user_info)
-            else:
-                return {
-                    'statusCode': 405,
-                    'headers': {'Content-Type': 'application/json'},
-                    'body': json.dumps({
-                        'message': f'Method not allowed: {http_method}',
-                        'error_details': {
-                            'method': http_method,
-                            'allowed_methods': ['GET', 'POST']
-                        }
-                    })
-                }
-        
-        return {
-            'statusCode': 404,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': f'Resource not found: {resource_path}',
-                'error_details': {'resource': resource_path}
-            })
-        }
-            
-    except Exception as e:
-        logger.error(f"Error in lambda_handler: {str(e)}")
-        logger.error(traceback.format_exc())
-        return {
-            'statusCode': 500,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': 'Internal server error',
-                'error_details': {'error': str(e)}
-            })
-        }
-
-    """Main Lambda handler with detailed logging."""
-    try:
-        logger.info("Lambda handler started")
-        logger.info(f"Event: {json.dumps(redact_sensitive(event))}")
-        logger.info(f"Lambda context: {context}")
-        
-        http_method = event.get('httpMethod')
-        resource_path = event.get('resource', '')
-        logger.info(f"HTTP Method: {http_method}, Resource: {resource_path}")
-        
-        # Extract user info from claims
-        claims = event.get('requestContext', {}).get('authorizer', {}).get('claims', {})
-        user_info = {
-            'username': claims.get('cognito:username'),
-            'email': claims.get('email'),
-            'role': claims.get('custom:role', 'user')
-        }
-        logger.info(f"User info from claims: {json.dumps(redact_sensitive(user_info))}")
-        
-        # Handle request based on path and method
-        if resource_path == '/process-patient':
-            if http_method == 'POST':
-                logger.info("Processing POST request for patient")
-                return handle_patient_post_request(event, user_info)
-            else:
-                logger.warning(f"Method not allowed: {http_method}")
-                return {
-                    'statusCode': 405,
-                    'headers': {'Content-Type': 'application/json'},
-                    'body': json.dumps({
-                        'message': f'Method not allowed: {http_method}',
-                        'error_details': {
-                            'method': http_method,
-                            'allowed_methods': ['POST']
-                        }
-                    })
-                }
-        
-        logger.warning(f"Resource not found: {resource_path}")
-        return {
-            'statusCode': 404,
-            'headers': {'Content-Type': 'application/json'},
-            'body': json.dumps({
-                'message': f'Resource not found: {resource_path}',
-                'error_details': {
-                    'resource': resource_path,
-                    'method': http_method
-                }
-            })
-        }
-            
-    except Exception as e:
-        logger.error(f"Unexpected error in lambda_handler: {str(e)}")
-        logger.error("Full traceback:")
         logger.error(traceback.format_exc())
         return {
             'statusCode': 500,

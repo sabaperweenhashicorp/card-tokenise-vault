@@ -37,7 +37,10 @@ resource "aws_iam_role_policy" "lambda_dynamodb" {
           "dynamodb:PutItem",
           "dynamodb:Query"
         ]
-        Resource = aws_dynamodb_table.patient_records.arn
+        Resource = [
+          aws_dynamodb_table.patient_records.arn,
+          "${aws_dynamodb_table.patient_records.arn}/index/*"  # Add this line for GSI access
+        ]
       }
     ]
   })
