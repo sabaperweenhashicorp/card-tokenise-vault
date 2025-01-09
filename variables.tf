@@ -35,7 +35,7 @@ variable "hvn_cidr_block" {
 variable "aws_account_id" {
   description = "AWS account ID"
   type        = string
-  default     = "992382806444"
+  default     = ""
 }
 
 variable "vpc_cidr" {
